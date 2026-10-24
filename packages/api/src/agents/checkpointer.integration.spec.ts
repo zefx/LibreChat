@@ -3,6 +3,7 @@ import { logger } from '@librechat/data-schemas';
 import { MongoMemoryServer } from 'mongodb-memory-server';
 import { HumanMessage } from '@librechat/agents/langchain/messages';
 import { MongoDBSaver } from '@langchain/langgraph-checkpoint-mongodb';
+import { Annotation, Command, StateGraph, START, END, interrupt } from '@langchain/langgraph';
 import { emptyCheckpoint, ERROR, INTERRUPT } from '@langchain/langgraph-checkpoint';
 import {
   getAgentCheckpointer,
@@ -721,6 +722,71 @@ describe('checkpointer (mongodb-memory-server integration)', () => {
     } finally {
       deletion.mockRestore();
     }
+  });
+});
+
+describe('LazyMongoSaver subagent persistence', () => {
+  it.each(['async', 'sync', 'exit'] as const)(
+    'resumes a subagent using %s durability without replaying completed reads',
+    async (durability) => {
+      const saver = await getAgentCheckpointer(MONGO_CFG);
+      const state = Annotation.Root({ text: Annotation<string>(), saved: Annotation<boolean>() });
+      let reads = 0;
+      let writes = 0;
+      const createWorkflow = () =>
+        new StateGraph(state)
+          .addNode('read', () => {
+            reads += 1;
+            return { text: 'synthetic page' };
+          })
+          .addNode('write', () => {
+            const approved = interrupt<boolean>('approve synthetic write');
+            if (!approved) {
+              return { saved: false };
+            }
+            writes += 1;
+            return { saved: true };
+          })
+          .addEdge(START, 'read')
+          .addEdge('read', 'write')
+          .addEdge('write', END)
+          .compile({ checkpointer: saver });
+      const config = {
+        durability,
+        configurable: {
+          thread_id: `subagent:${durability}`,
+          [LIBRECHAT_CHECKPOINT_NAMESPACE_KEY]: 'synthetic-generation',
+        },
+      };
+      const paused = await createWorkflow().invoke({ text: '' }, config);
+      expect(paused.__interrupt__).toHaveLength(1);
+      expect((await createWorkflow().getState(config)).tasks).toHaveLength(1);
+      const completed = await createWorkflow().invoke(new Command({ resume: true }), config);
+      expect(completed.saved).toBe(true);
+      expect(reads).toBe(1);
+      expect(writes).toBe(1);
+      const tuple = await saver!.getTuple(config);
+      expect(tuple?.checkpoint.channel_values.saved).toBe(true);
+    },
+  );
+
+  it('retains forked subagent checkpoints before their pending bookkeeping arrives', async () => {
+    const saver = await getAgentCheckpointer(MONGO_CFG);
+    const { config, checkpoint, metadata } = putArgs('subagent:fork-target');
+    const stored = await saver!.put(config, checkpoint, metadata);
+    await saver!.putWrites(
+      stored,
+      [
+        ['__resume__', true],
+        ['__no_writes__', null],
+      ],
+      'task-1',
+    );
+    const tuple = await saver!.getTuple(config);
+    expect(tuple?.checkpoint.id).toBe(checkpoint.id);
+    expect(tuple?.pendingWrites?.map((row) => row[1])).toEqual(['__resume__', '__no_writes__']);
+    await saver!.deleteThread('subagent:fork-target');
+    expect(await saver!.getTuple(config)).toBeUndefined();
   });
 });
 

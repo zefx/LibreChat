@@ -55,9 +55,13 @@ function generationCheckpointNamespace(config: RunnableConfig): string | undefin
   return typeof value === 'string' && value.length > 0 ? value : undefined;
 }
 
-function isEventActorInvocation(config: RunnableConfig): boolean {
+function requiresFullCheckpointPersistence(config: RunnableConfig): boolean {
   const value = config.configurable?.[LIBRECHAT_EVENT_ACTOR_INVOCATION_KEY];
-  return typeof value === 'string' && value.length > 0;
+  const threadId = config.configurable?.thread_id;
+  return (
+    (typeof value === 'string' && value.length > 0) ||
+    (typeof threadId === 'string' && threadId.startsWith('subagent:'))
+  );
 }
 
 /** Prefix every root/subgraph storage namespace with the immutable generation. */
@@ -239,13 +243,11 @@ function hasResumableWrite(writes: PendingWrite[]): boolean {
  * so this is effectively interrupt-only and the common path writes nothing; the broader
  * real-channel rule just keeps it honest for delta graphs.
  *
- * **Invariant.** Correctness depends on `durability: 'exit'` (which the SDK sets whenever a
- * checkpointer is active): exactly one parentless boundary checkpoint per run, with its
- * `putWrites` ordered before its `put`. Under per-step durability LangGraph instead emits
- * `put`-before-`putWrites` for chained checkpoints — the anchor would arrive too late and a
- * checkpoint could be wrongly discarded. The SDK never runs HITL that way; if that ever changes,
- * this saver must be revisited (a parent-based guard is NOT viable — a resumed turn's clean
- * completion is itself a parented, write-less checkpoint that we correctly discard).
+ * **invariant.** lazy retention applies only to ordinary chat roots using `durability: 'exit'`.
+ * sdk-owned `subagent:` threads use per-step durability and fork checkpoint lineages with
+ * `put` before `putWrites`; they must retain every checkpoint and bookkeeping write, including
+ * clean completion heads used to recover settled child work. event actors also retain full
+ * state. all paths preserve owner/namespace scoping, size limits, cleanup, and mongo ttl.
  *
  * **Correctness.** Checkpoints with resumable writes (interrupt + real-channel/delta anchor) and
  * the writes themselves persist exactly as before, so resume is unchanged. The write-less clean
@@ -375,7 +377,7 @@ export class LazyMongoSaver extends OwnedMongoSaver {
     taskId: string,
   ): Promise<void> {
     const storageConfig = toStorageCheckpointConfig(config);
-    if (isEventActorInvocation(config)) {
+    if (requiresFullCheckpointPersistence(config)) {
       return super.putWrites(storageConfig, writes, taskId);
     }
     const checkpointId = config.configurable?.checkpoint_id as string | undefined;
@@ -433,7 +435,7 @@ export class LazyMongoSaver extends OwnedMongoSaver {
     checkpoint: Checkpoint,
     metadata: CheckpointMetadata,
   ): Promise<RunnableConfig> {
-    if (isEventActorInvocation(config)) {
+    if (requiresFullCheckpointPersistence(config)) {
       await this.assertCheckpointFitsDocument(config, checkpoint, metadata);
       const persisted = await super.put(toStorageCheckpointConfig(config), checkpoint, metadata);
       logger.debug(
